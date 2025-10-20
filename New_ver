@@ -1,0 +1,287 @@
+"""
+title: Vertex AI Multi-Agent Manager (Simple REST)
+author: Your Name
+version: 2.4.0
+license: MIT
+description: シンプル版 - 非ストリーミングのみでGeminiとReasoning Engineを管理
+"""
+
+from pydantic import BaseModel, Field
+from typing import Iterator, Union, List, Dict
+import requests
+import json
+import google.auth
+from google.auth.transport.requests import Request as GoogleRequest
+
+class Pipe:
+    class Valves(BaseModel):
+        # 共通設定
+        PROJECT_ID: str = Field(
+            default="522847804541",
+            description="Google Cloud プロジェクト番号",
+        )
+        LOCATION: str = Field(
+            default="us-central1",
+            description="ロケーション",
+        )
+        ENABLE_STREAMING: bool = Field(
+            default=False,
+            description="ストリーミングを有効化（実験的機能）",
+        )
+        
+        AGENTS_CONFIG: str = Field(
+            default="""
+[
+    {
+        "id": "root-agent",
+        "name": "Root Agent (Research)",
+        "type": "reasoning_engine",
+        "engine_id": "1795410129181474816",
+        "description": "学術調査、ニュース、情報収集のためのリサーチアシスタント"
+    },
+    {
+        "id": "analyst-agent",
+        "name": "Analyst Agent (Data Analysis)",
+        "type": "reasoning_engine",
+        "engine_id": "1215290202180812800",
+        "description": "データ分析とビジネスインサイト抽出の専門家"
+    },
+    {
+        "id": "gemini-2-flash",
+        "name": "Gemini 2.0 Flash",
+        "type": "gemini_api",
+        "model": "gemini-2.0-flash-exp",
+        "description": "最新の高速Gemini 2.0 Flashモデル"
+    },
+    {
+        "id": "gemini-2-thinking",
+        "name": "Gemini 2.0 Flash Thinking",
+        "type": "gemini_api",
+        "model": "gemini-2.0-flash-thinking-exp-1219",
+        "description": "思考プロセス付きGemini 2.0"
+    },
+    {
+        "id": "gemini-15-pro",
+        "name": "Gemini 1.5 Pro",
+        "type": "gemini_api",
+        "model": "gemini-1.5-pro-002",
+        "description": "安定版Gemini 1.5 Pro"
+    },
+    {
+        "id": "gemini-15-flash",
+        "name": "Gemini 1.5 Flash",
+        "type": "gemini_api",
+        "model": "gemini-1.5-flash-002",
+        "description": "安定版Gemini 1.5 Flash"
+    }
+]
+            """,
+            description="エージェント設定 (JSON形式)",
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+        self._load_agents()
+        self._credentials = None
+
+    def _load_agents(self):
+        """設定からエージェントリストを読み込み"""
+        try:
+            self.agents = json.loads(self.valves.AGENTS_CONFIG)
+        except json.JSONDecodeError:
+            print("⚠️ AGENTS_CONFIG のJSON解析に失敗しました")
+            self.agents = []
+
+    def _get_credentials(self):
+        """Cloud Runのデフォルト認証を取得"""
+        if self._credentials is None or not self._credentials.valid:
+            self._credentials, _ = google.auth.default(
+                scopes=['https://www.googleapis.com/auth/cloud-platform']
+            )
+        
+        if not self._credentials.valid:
+            self._credentials.refresh(GoogleRequest())
+        
+        return self._credentials
+
+    def pipes(self) -> List[Dict[str, str]]:
+        """利用可能な全エージェント/モデルのリストを返す"""
+        self._load_agents()
+        
+        return [
+            {
+                "id": agent["id"],
+                "name": agent["name"]
+            }
+            for agent in self.agents
+        ]
+
+    def pipe(self, body: dict, __user__: dict) -> Union[str, Iterator[str]]:
+        """選択されたエージェント/モデルでクエリを実行"""
+        
+        selected_model = body.get("model", "")
+        
+        agent_id = None
+        for agent in self.agents:
+            if agent["id"] in selected_model:
+                agent_id = agent["id"]
+                break
+        
+        if not agent_id:
+            return "Error: エージェント/モデルが見つかりません"
+        
+        agent_config = next(
+            (a for a in self.agents if a["id"] == agent_id),
+            None
+        )
+        
+        if not agent_config:
+            return f"Error: エージェント '{agent_id}' の設定が見つかりません"
+        
+        agent_type = agent_config.get("type", "reasoning_engine")
+        
+        if agent_type == "reasoning_engine":
+            return self._call_reasoning_engine(
+                body=body,
+                __user__=__user__,
+                engine_id=agent_config["engine_id"]
+            )
+        elif agent_type == "gemini_api":
+            return self._call_gemini_rest_api(
+                body=body,
+                model=agent_config["model"]
+            )
+        else:
+            return f"Error: 未対応のタイプ '{agent_type}'"
+
+    def _call_reasoning_engine(
+        self,
+        body: dict,
+        __user__: dict,
+        engine_id: str
+    ) -> Union[str, Iterator[str]]:
+        """Reasoning Engine にクエリを送信"""
+        
+        try:
+            credentials = self._get_credentials()
+            
+            messages = body.get("messages", [])
+            user_message = ""
+            
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    user_message = msg.get("content", "")
+                    break
+            
+            if not user_message:
+                return "Error: ユーザーメッセージが見つかりません"
+            
+            user_id = __user__.get("id", "default-user")
+            
+            # 非ストリーミングエンドポイントを使用
+            url = (
+                f"https://{self.valves.LOCATION}-aiplatform.googleapis.com/v1/"
+                f"projects/{self.valves.PROJECT_ID}/locations/{self.valves.LOCATION}/"
+                f"reasoningEngines/{engine_id}:query"
+            )
+            
+            headers = {
+                "Authorization": f"Bearer {credentials.token}",
+                "Content-Type": "application/json",
+            }
+            
+            payload = {
+                "input": {
+                    "message": user_message,
+                    "user_id": user_id
+                }
+            }
+            
+            response = requests.post(url=url, json=payload, headers=headers, timeout=120)
+            response.raise_for_status()
+            result = response.json()
+            
+            if isinstance(result, dict):
+                if 'content' in result and 'parts' in result['content']:
+                    parts = result['content']['parts']
+                    if len(parts) > 0 and 'text' in parts[0]:
+                        return parts[0]['text']
+                elif 'text' in result:
+                    return result['text']
+                else:
+                    return json.dumps(result, indent=2, ensure_ascii=False)
+            else:
+                return str(result)
+                
+        except requests.exceptions.Timeout:
+            return "Error: リクエストがタイムアウトしました（120秒）"
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            return f"Error: {str(e)}\n\nDetails:\n{error_details}"
+
+    def _call_gemini_rest_api(
+        self,
+        body: dict,
+        model: str
+    ) -> str:
+        """Gemini REST APIを直接呼び出し（非ストリーミング）"""
+        
+        try:
+            credentials = self._get_credentials()
+            
+            messages = body.get("messages", [])
+            user_message = ""
+            
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    user_message = msg.get("content", "")
+                    break
+            
+            if not user_message:
+                return "Error: ユーザーメッセージが見つかりません"
+            
+            # Gemini REST API エンドポイント（非ストリーミング）
+            url = (
+                f"https://{self.valves.LOCATION}-aiplatform.googleapis.com/v1/"
+                f"projects/{self.valves.PROJECT_ID}/locations/{self.valves.LOCATION}/"
+                f"publishers/google/models/{model}:generateContent"
+            )
+            
+            headers = {
+                "Authorization": f"Bearer {credentials.token}",
+                "Content-Type": "application/json",
+            }
+            
+            # Gemini API用のペイロード
+            payload = {
+                "contents": [{
+                    "role": "user",
+                    "parts": [{"text": user_message}]
+                }],
+                "generationConfig": {
+                    "temperature": 0.7,
+                    "maxOutputTokens": 8192,
+                }
+            }
+            
+            response = requests.post(url=url, json=payload, headers=headers, timeout=120)
+            response.raise_for_status()
+            result = response.json()
+            
+            # レスポンスからテキストを抽出
+            if 'candidates' in result and len(result['candidates']) > 0:
+                candidate = result['candidates'][0]
+                if 'content' in candidate and 'parts' in candidate['content']:
+                    parts = candidate['content']['parts']
+                    if len(parts) > 0 and 'text' in parts[0]:
+                        return parts[0]['text']
+            
+            return json.dumps(result, indent=2, ensure_ascii=False)
+            
+        except requests.exceptions.Timeout:
+            return "Error: リクエストがタイムアウトしました（120秒）"
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            return f"Error: {str(e)}\n\nDetails:\n{error_details}"
